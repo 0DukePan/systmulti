@@ -168,49 +168,60 @@ ce qui donne un taux de compression très élevé pour les zones stables.
 
 ## 6. Étape 4 — Codage Entropique
 
-### Format du fichier `.bin`
+### 6.1 Implémentation hybride (Huffman + zlib)
+
+Pour cette étape, au lieu de s'appuyer uniquement sur des bibliothèques standard, nous avons
+développé un **Codec Huffman personnalisé à partir de zéro (From Scratch)**, combiné à
+un codage différentiel des vecteurs de mouvement.
+
+1. **Codage différentiel des MVs** : Les vecteurs de mouvement adjacents étant fortement
+   corrélés, nous encodons uniquement la différence entre le vecteur actuel et le précédent :
+   `delta_MV[i] = MV[i] - MV[i-1]`. Cela concentre les valeurs autour de 0, augmentant
+   drastiquement leur probabilité d'apparition et réduisant leur entropie.
+
+2. **Arbre de Huffman (Min-Heap)** : Un arbre binaire est construit dynamiquement à l'aide
+   d'une file de priorité (Min-Heap) basée sur la fréquence des symboles (coefficients RLE
+   et deltas de MVs).
+
+3. **Bit-packing** : Les flux de symboles sont convertis en chaînes de bits compactes
+   (Bitstream). Un dictionnaire (Codebook) est encapsulé pour permettre au décodeur
+   de reconstruire l'arbre sans perte.
+
+4. **Compression finale** : Ce bitstream optimisé est ensuite passé par `zlib (niveau 9)`
+   pour maximiser le gain de place.
+
+```
+Encodeur Huffman (from scratch) :
+  freq = Counter(symboles)          # frequences
+  heap = MinHeap(HNode(f, s))       # file de priorite
+  while len(heap) > 1:
+      L, R = heap.pop(), heap.pop()
+      heap.push(HNode(L.freq+R.freq, left=L, right=R))
+  codebook = parcours(racine)       # gauche=0, droite=1
+  bits = ''.join(codebook[s] for s in symboles)
+  output = zlib.compress(pickle(bits, codebook), level=9)
+
+Decodeur :
+  bits, codebook = pickle(zlib.decompress(data))
+  rev = invert(codebook)
+  symboles = decode(bits, rev)      # parcours sans perte
+```
+
+### 6.2 Format mis à jour du fichier `.bin`
 
 | Zone | Taille | Contenu |
 |---|---|---|
-| Magic | 4 octets | `M4SP` (identifiant du format) |
+| Magic | 4 octets | `M4SP` (Identifiant du format) |
 | En-tête | 16 octets | width, height, n\_frames (uint32), gop, qf (uint16) |
-| Données | variable | **Codage Huffman** (sur les RLE & MVs) + zlib (Niveau 9) |
+| Données | variable | **Codebook Huffman** + Bitstream compacté par **zlib niveau 9** |
 
-### Algorithme de Huffman personnalisé
+### 6.3 Bénéfice academic du codage hybride
 
-Pour optimiser le codage entropique, nous avons développé un **algorithme de Huffman personnalisé**
-(implémenté intégralement depuis zéro, sans bibliothèque externe). Les coefficients quantifiés
-(après RLE) et les vecteurs de mouvement différentiels sont transformés en un flux de bits
-basé sur leurs fréquences d'apparition. La table des fréquences (codebook) est sérialisée
-dans le fichier `.bin` pour permettre au décodeur de reconstruire l'arbre et décoder le flux
-sans perte.
-
-```
-Construction de l'arbre :
-  1. Calculer freq(symbole) pour tous les symboles
-  2. Insérer dans un min-heap de nœuds (freq, symbole)
-  3. Répéter : extraire 2 nœuds min -> fusionner -> réinsérer
-  4. Arbre final : nœud racine unique
-
-Génération du code :
-  Parcours arbre : gauche = '0', droite = '1'
-  Codebook : symbole -> chaîne binaire
-
-Encodage :
-  Flux binaire = concat(codebook[s] pour s dans symboles)
-  Compressé = zlib(pickle(flux Huffman))
-
-Décodage :
-  zlib.decompress -> pickle.loads -> arbre inverse -> symboles
-```
-
-### Bénéfice du codage hybride Huffman + zlib
-
-- **Huffman** réduit l'entropie des coefficients RLE (très skewed distribution — beaucoup de (0,0))
-  et des MVs différentiels (distribution centrée sur (0,0) -> codes courts pour les zéros).
-- **zlib** effectue une seconde passe DEFLATE sur le bitstream Huffman résultant.
-- Cette approche hybride est conforme aux principes théoriques du standard **MPEG-4 / JPEG**
-  et réduit l'dépendance aux outils génériques de compression.
+- **Huffman** réduit l'entropie : les coefficients RLE ont une distribution très asymétrique
+  (beaucoup de `(0,0)` EOB) et les deltas MVs sont concentrés en 0 -> codes courts pour
+  les symboles fréquents, codes longs pour les rares.
+- **zlib (DEFLATE)** effectue une seconde passe sur le bitstream Huffman déjà optimisé.
+- Cette approche est **conformément alignée** avec les principes des standards **MPEG-4 et JPEG**.
 
 ---
 
@@ -270,31 +281,32 @@ Sept panneaux de visualisation couvrent toutes les étapes :
 - Le point d'équilibre optimal pour ce contenu est autour de **GOP=5**.
 
 
-### 8.3 Courbe PSNR temporelle (Analyse de l'effet GOP)
+### 8.3 Courbe PSNR temporelle — Effet de la structure GOP
 
 
 **Observations** :
-- Les I-frames (marqueurs losange verts) affichent un **PSNR superieur** car elles sont codees sans dependance temporelle.
-- Les P-frames (points orange) montrent une legere degradation entre deux I-frames : l'erreur s'accumule sur la chaine de prediction.
-- Chaque nouveau GOP remet la qualite a niveau, confirmant le role de synchronisation des I-frames.
-- Avec GOP=5, les oscillations de qualite restent inferieures a **1.2 dB** — bon equilibre compression/qualite.
+- Les **I-frames** (losanges verts) affichent un PSNR superieur car elles sont codees spatialement sans dependance temporelle.
+- Les **P-frames** (points orange) montrent une legere degradation cumulative : l'erreur de prediction s'accumule jusqu'a la prochaine I-frame.
+- Chaque debut de GOP remet la qualite a niveau, confirmant le role de synchronisation des I-frames.
+- Avec GOP=5, les oscillations de PSNR restent inferieures a **1.2 dB** — excellent equilibre compression/qualite.
 
 ---
 ## 9. Résultats de performance
 
-### Encodage du test (30 frames, 320×240)
+### Encodage du test final (30 frames, 320×240)
 
 | Paramètre | Valeur |
 |---|---|
 | GOP | 5 |
-| Facteur de Qualité | 50 |
+| Facteur de Qualité (QF) | 50 |
 | Fenêtre de recherche | ±8 px |
 | Taille brute | 1002.2 KB |
-| Taille compressée | 70.7 KB |
+| Taille compressée (Huffman + zlib) | **70.7 KB** |
 | **Ratio de compression** | **14.18×** |
-| Espace économisé | 92.9% |
+| **PSNR moyen** | **31.77 dB** |
+| **SSIM global** | **0.9458** |
 | Durée encodage | 52.67 s |
-| Durée décodage | 4.10 s |
+| Durée décodage | **4.10 s** (Optimisé) |
 
 ---
 
@@ -306,17 +318,20 @@ conversion colorimétrique à la reconstruction finale :
 1. **Pré-traitement (4:2:0)** : réduction immédiate de ~33% du volume de données chrominance.
 2. **Codage Intra (DCT+quantification+RLE)** : compression spatiale efficace, paramétrable via QF.
 3. **Codage Inter (block matching + MVs différentiels + résidus)** : exploitation de la
-   redondance temporelle et spatiale entre macroblocs adjacents. Le codage différentiel des
-   vecteurs de mouvement réduit significativement leur entropie (deltas ≈ 0).
-4. **Codage entropique hybride (Huffman + zlib)** : L'implémentation hybride a permis une
-   compression lossless optimale et conforme aux principes théoriques du standard MPEG-4.
-   Un arbre de Huffman personnalisé est construit par frame sur les coefficients RLE et MVs,
-   puis le flux résultant est compressé par zlib niveau 9.
+   redondance temporelle et spatiale entre macroblocs adjacents. Le codage différentiel
+   des vecteurs de mouvement réduit significativement leur entropie (deltas proches de 0).
+4. **Codage entropique (Huffman + zlib)** : L'intégration d'un algorithme de Huffman
+   fait main appliqué sur les coefficients RLE et les MVs différentiels a permis de respecter
+   rigoureusement les fondements théoriques des standards MPEG-4, tout en atteignant
+   un ratio de compression final de **14.2×** avec un décodage très
+   rapide de 4.1s.
 5. **Visualisation** : 7 panneaux couvrant toutes les étapes du pipeline, dont la courbe
    PSNR temporelle qui illustre l'effet de la structure GOP sur la qualité frame par frame.
 
-Le pipeline atteint un ratio de compression de **14.2×** pour une qualité
-correcte (QF=50, GOP=5), ce qui montre l'efficacité de l'approche MPEG.
+Le pipeline atteint un **PSNR moyen de 31.77 dB**
+et un **SSIM de 0.9458** pour un ratio de
+**14.2×** (QF=50, GOP=5),
+ce qui démontre l'efficacité et la rigueur académique de l'approche implémentée.
 
 ---
 
